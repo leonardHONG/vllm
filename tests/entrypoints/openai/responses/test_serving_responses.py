@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+from collections import deque
 from contextlib import AsyncExitStack
 from unittest.mock import MagicMock
 
@@ -35,6 +37,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.responses.context import ConversationContext, SimpleContext
 from vllm.entrypoints.openai.responses.protocol import (
+    DeleteResponseResponse,
     ResponseCreatedEvent,
     ResponseRawMessageAndToken,
     ResponsesRequest,
@@ -1124,3 +1127,93 @@ class TestAutoToolStreaming:
             if event.type == "response.function_call_arguments.delta"
         ]
         assert "".join(argument_deltas) == '{"location":"Berlin"}'
+
+
+class TestResponseStoreManagement:
+    """Tests for DELETE /v1/responses/{response_id} store cleanup."""
+
+    @pytest_asyncio.fixture
+    async def serving_instance(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_ENABLE_RESPONSES_API_STORE", True)
+
+        engine_client = MagicMock()
+        model_config = MagicMock()
+        model_config.max_model_len = 100
+        model_config.hf_config.model_type = "test"
+        model_config.get_diff_sampling_param.return_value = {}
+        engine_client.model_config = model_config
+        engine_client.input_processor = MagicMock()
+        engine_client.renderer = MagicMock()
+
+        instance = OpenAIServingResponses(
+            engine_client=engine_client,
+            models=MagicMock(),
+            openai_serving_render=MagicMock(),
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+        return instance
+
+    def _make_response(self, response_id: str,
+                       status: str = "completed") -> ResponsesResponse:
+        resp = ResponsesResponse.from_request(
+            request=ResponsesRequest(model="test", input="hi"),
+            sampling_params=MagicMock(),
+            model_name="test",
+            created_time=0,
+            output=[],
+            status=status,
+            usage=None,
+        )
+        resp.id = response_id
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_delete_existing_response(self, serving_instance):
+        inst = serving_instance
+        resp = self._make_response("resp_1")
+        inst.response_store["resp_1"] = resp
+        inst.msg_store["resp_1"] = [{"role": "user", "content": "hi"}]
+
+        result = await inst.delete_responses("resp_1")
+
+        assert isinstance(result, DeleteResponseResponse)
+        assert result.id == "resp_1"
+        assert result.deleted is True
+        assert "resp_1" not in inst.response_store
+        assert "resp_1" not in inst.msg_store
+
+    @pytest.mark.asyncio
+    async def test_delete_nonexistent_response(self, serving_instance):
+        result = await serving_instance.delete_responses("resp_missing")
+        assert isinstance(result, ErrorResponse)
+        assert result.error.code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_cleans_up_event_store(self, serving_instance):
+        inst = serving_instance
+        resp = self._make_response("resp_ev")
+        inst.response_store["resp_ev"] = resp
+        inst.event_store["resp_ev"] = (deque(), asyncio.Event())
+
+        result = await inst.delete_responses("resp_ev")
+
+        assert isinstance(result, DeleteResponseResponse)
+        assert "resp_ev" not in inst.event_store
+
+    @pytest.mark.asyncio
+    async def test_delete_cancels_in_progress_task(self, serving_instance):
+        inst = serving_instance
+        resp = self._make_response("resp_bg", status="in_progress")
+        inst.response_store["resp_bg"] = resp
+
+        task = asyncio.create_task(asyncio.sleep(3600))
+        inst.background_tasks["resp_bg"] = task
+
+        result = await inst.delete_responses("resp_bg")
+
+        assert isinstance(result, DeleteResponseResponse)
+        assert task.cancelled()
+        assert "resp_bg" not in inst.response_store
+        assert "resp_bg" not in inst.background_tasks

@@ -82,6 +82,7 @@ from vllm.entrypoints.openai.responses.harmony import (
     response_input_to_harmony,
 )
 from vllm.entrypoints.openai.responses.protocol import (
+    DeleteResponseResponse,
     InputTokensDetails,
     OutputTokensDetails,
     ResponseCompletedEvent,
@@ -1315,6 +1316,34 @@ class OpenAIServingResponses(OpenAIServing):
             except asyncio.CancelledError:
                 logger.exception("Background task for %s was cancelled", response_id)
         return response
+
+    async def delete_responses(
+        self,
+        response_id: str,
+    ) -> ErrorResponse | DeleteResponseResponse:
+        async with self.response_store_lock:
+            response = self.response_store.get(response_id)
+            if response is None:
+                return self._make_not_found_error(response_id)
+
+            # Cancel in-progress work before deleting.
+            if response.status in ("queued", "in_progress"):
+                response.status = "cancelled"
+                if task := self.background_tasks.get(response_id):
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            del self.response_store[response_id]
+
+        # Clean up associated stores.
+        self.msg_store.pop(response_id, None)
+        self.event_store.pop(response_id, None)
+        self.background_tasks.pop(response_id, None)
+
+        return DeleteResponseResponse(id=response_id)
 
     def _make_not_found_error(self, response_id: str) -> ErrorResponse:
         return self.create_error_response(

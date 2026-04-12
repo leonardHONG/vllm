@@ -493,6 +493,12 @@ class ResponsesRequest(OpenAIBaseModel):
         return data
 
 
+class DeleteResponseResponse(OpenAIBaseModel):
+    id: str
+    object: Literal["response"] = "response"
+    deleted: bool = True
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
     created_at: int = Field(default_factory=lambda: int(time.time()))

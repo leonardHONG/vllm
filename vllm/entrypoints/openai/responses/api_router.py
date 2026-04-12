@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.responses.protocol import (
+    DeleteResponseResponse,
     ResponsesRequest,
     ResponsesResponse,
     StreamingResponsesResponse,
@@ -121,6 +122,24 @@ async def cancel_responses(response_id: str, raw_request: Request):
             content=response.model_dump(mode="json", by_alias=True),
             status_code=response.error.code,
         )
+    return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
+
+
+@router.delete("/v1/responses/{response_id}")
+@load_aware_call
+async def delete_responses(response_id: str, raw_request: Request):
+    handler = responses(raw_request)
+    if handler is None:
+        raise NotImplementedError("The model does not support Responses API")
+
+    response = await handler.delete_responses(response_id)
+
+    if isinstance(response, ErrorResponse):
+        return JSONResponse(
+            content=response.model_dump(mode="json", by_alias=True),
+            status_code=response.error.code,
+        )
+    assert isinstance(response, DeleteResponseResponse)
     return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
 
 
