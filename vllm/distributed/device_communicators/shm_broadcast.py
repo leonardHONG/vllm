@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import pickle
+import struct
 import sys
 import threading
 import time
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -43,7 +45,160 @@ if TYPE_CHECKING:
 
 VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 
+# Opt-in integrity envelope on the inline shm payload. See issue #27858 and
+# the diagnostic envelope below. Cached at import to match the existing
+# VLLM_RINGBUFFER_WARNING_INTERVAL pattern; tests use mock.patch to override.
+VLLM_SHM_BROADCAST_VERIFY = envs.VLLM_SHM_BROADCAST_VERIFY
+
+# Inline-payload envelope layout. The whole envelope sits between the
+# overflow byte at offset 0 and the original inline payload format.
+#
+#   chunk: [overflow:1][envelope:16][inline_payload:N]
+#   envelope: magic(4) + version(1) + reserved(3) + payload_len(4) + crc32(4)
+#
+# `crc32` covers exactly the `inline_payload` bytes that follow the envelope.
+# Header lives at the start (not as a footer) so it is fully written before
+# `metadata_buffer[0] = 1` is set; that way a reader who observes the written
+# flag observes a self-consistent header in the same memory-ordering window.
+_ENVELOPE_MAGIC = b"VSB1"
+_ENVELOPE_VERSION = 1
+_ENVELOPE_HEADER_SIZE = 16
+_ENVELOPE_HEADER_FORMAT = ">4sB3sII"
+_ENVELOPE_PAYLOAD_OFFSET = 1 + _ENVELOPE_HEADER_SIZE  # = 17
+
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
+
+
+class ShmBroadcastCorruptionError(RuntimeError):
+    """Raised when the inline shm_broadcast integrity envelope fails to verify.
+
+    Only raised when ``VLLM_SHM_BROADCAST_VERIFY=1``. All fields are plain
+    Python types so the exception is safe to pickle across the worker →
+    engine-core boundary.
+
+    See https://github.com/vllm-project/vllm/issues/27858 for the underlying
+    bug class this exception is intended to surface.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        slot_idx: int,
+        reader_rank: int,
+        declared_payload_len: int,
+        usable_buffer_len: int,
+        expected_crc: int,
+        actual_crc: int,
+        header_hex: str,
+        payload_head_hex: str,
+    ) -> None:
+        super().__init__(
+            f"shm_broadcast envelope verification failed ({reason}); "
+            f"slot={slot_idx} reader_rank={reader_rank} "
+            f"declared_payload_len={declared_payload_len} "
+            f"usable_buffer_len={usable_buffer_len} "
+            f"expected_crc=0x{expected_crc:08x} actual_crc=0x{actual_crc:08x} "
+            f"header={header_hex} payload_head={payload_head_hex}"
+        )
+        self.reason = reason
+        self.slot_idx = slot_idx
+        self.reader_rank = reader_rank
+        self.declared_payload_len = declared_payload_len
+        self.usable_buffer_len = usable_buffer_len
+        self.expected_crc = expected_crc
+        self.actual_crc = actual_crc
+        self.header_hex = header_hex
+        self.payload_head_hex = payload_head_hex
+
+
+def _build_inline_payload(all_buffers: list) -> bytes:
+    """Serialize the legacy inline payload format into one bytes object.
+
+    Mirrors the byte layout that the original ``enqueue`` inline branch wrote
+    directly into shm: ``[oob_count:2][len:4][buf0][len:4][buf1]...``. Used
+    only when the envelope is enabled, so we can compute crc32 over the
+    exact bytes that will be placed in shared memory.
+    """
+    parts: list[bytes] = [to_bytes_big(len(all_buffers), 2)]
+    for buffer in all_buffers:
+        parts.append(to_bytes_big(len(buffer), 4))
+        parts.append(bytes(buffer))
+    return b"".join(parts)
+
+
+def _build_envelope_header(payload: bytes) -> bytes:
+    return struct.pack(
+        _ENVELOPE_HEADER_FORMAT,
+        _ENVELOPE_MAGIC,
+        _ENVELOPE_VERSION,
+        b"\x00\x00\x00",
+        len(payload),
+        zlib.crc32(payload) & 0xFFFFFFFF,
+    )
+
+
+def _verify_envelope(buf, slot_idx: int, reader_rank: int) -> memoryview:
+    """Validate the envelope at the head of ``buf`` and return a view over the
+    inline payload that follows.
+
+    Raises :class:`ShmBroadcastCorruptionError` on any structural or crc
+    mismatch. The ``buf`` argument is a memoryview into one shm chunk
+    starting at the overflow byte.
+    """
+    if len(buf) < _ENVELOPE_PAYLOAD_OFFSET:
+        raise ShmBroadcastCorruptionError(
+            reason="buffer smaller than envelope header",
+            slot_idx=slot_idx,
+            reader_rank=reader_rank,
+            declared_payload_len=0,
+            usable_buffer_len=len(buf),
+            expected_crc=0,
+            actual_crc=0,
+            header_hex="",
+            payload_head_hex="",
+        )
+
+    header_bytes = bytes(buf[1:_ENVELOPE_PAYLOAD_OFFSET])
+    magic, version, _reserved, payload_len, expected_crc = struct.unpack(
+        _ENVELOPE_HEADER_FORMAT, header_bytes
+    )
+
+    payload_end = _ENVELOPE_PAYLOAD_OFFSET + payload_len
+
+    def _fail(reason: str, actual_crc: int = 0) -> ShmBroadcastCorruptionError:
+        head_n = min(64, max(0, min(payload_len, len(buf) - _ENVELOPE_PAYLOAD_OFFSET)))
+        try:
+            payload_head = bytes(
+                buf[_ENVELOPE_PAYLOAD_OFFSET : _ENVELOPE_PAYLOAD_OFFSET + head_n]
+            ).hex()
+        except Exception:
+            payload_head = ""
+        return ShmBroadcastCorruptionError(
+            reason=reason,
+            slot_idx=slot_idx,
+            reader_rank=reader_rank,
+            declared_payload_len=payload_len,
+            usable_buffer_len=len(buf),
+            expected_crc=expected_crc,
+            actual_crc=actual_crc,
+            header_hex=header_bytes.hex(),
+            payload_head_hex=payload_head,
+        )
+
+    if magic != _ENVELOPE_MAGIC:
+        raise _fail(f"bad magic (got {magic!r})")
+    if version != _ENVELOPE_VERSION:
+        raise _fail(f"unsupported envelope version {version}")
+    if payload_len < 0 or payload_end > len(buf):
+        raise _fail("declared payload length exceeds buffer")
+
+    payload_view = buf[_ENVELOPE_PAYLOAD_OFFSET:payload_end]
+    actual_crc = zlib.crc32(payload_view) & 0xFFFFFFFF
+    if actual_crc != expected_crc:
+        raise _fail("crc32 mismatch", actual_crc=actual_crc)
+
+    return payload_view
 
 
 # Memory fence for cross-process shared memory visibility.
@@ -720,10 +875,29 @@ class MessageQueue:
             obj, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
         )
         if self.n_local_reader > 0:
-            if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
+            envelope_overhead = (
+                _ENVELOPE_HEADER_SIZE if VLLM_SHM_BROADCAST_VERIFY else 0
+            )
+            if (
+                total_bytes + len(all_buffers[0]) + envelope_overhead
+                >= self.buffer.max_chunk_bytes
+            ):
                 with self.acquire_write(timeout) as buf:
                     buf[0] = 1  # overflow
                 self.local_socket.send_multipart(all_buffers, copy=False)
+            elif VLLM_SHM_BROADCAST_VERIFY:
+                # Inline path with diagnostic envelope. Layout:
+                #   buf[0]            : 0  (not overflow)
+                #   buf[1:17]         : envelope header (magic + version +
+                #                       reserved + payload_len + crc32)
+                #   buf[17:17+plen]   : legacy inline payload bytes
+                inline_payload = _build_inline_payload(all_buffers)
+                header = _build_envelope_header(inline_payload)
+                with self.acquire_write(timeout) as buf:
+                    buf[0] = 0
+                    buf[1:_ENVELOPE_PAYLOAD_OFFSET] = header
+                    end = _ENVELOPE_PAYLOAD_OFFSET + len(inline_payload)
+                    buf[_ENVELOPE_PAYLOAD_OFFSET:end] = inline_payload
             else:
                 # Byte 0: 0
                 # Bytes 1-2: Count of buffers
@@ -755,14 +929,29 @@ class MessageQueue:
             with self.acquire_read(timeout, indefinite) as buf:
                 overflow = buf[0] == 1
                 if not overflow:
-                    offset = 3
-                    buf_count = from_bytes_big(buf[1:offset])
-                    all_buffers = []
-                    for i in range(buf_count):
-                        buf_offset = offset + 4
-                        buf_len = from_bytes_big(buf[offset:buf_offset])
-                        offset = buf_offset + buf_len
-                        all_buffers.append(buf[buf_offset:offset])
+                    if VLLM_SHM_BROADCAST_VERIFY:
+                        payload = _verify_envelope(
+                            buf,
+                            slot_idx=self.current_idx,
+                            reader_rank=self.local_reader_rank,
+                        )
+                        offset = 2
+                        buf_count = from_bytes_big(payload[0:offset])
+                        all_buffers = []
+                        for i in range(buf_count):
+                            buf_offset = offset + 4
+                            buf_len = from_bytes_big(payload[offset:buf_offset])
+                            offset = buf_offset + buf_len
+                            all_buffers.append(payload[buf_offset:offset])
+                    else:
+                        offset = 3
+                        buf_count = from_bytes_big(buf[1:offset])
+                        all_buffers = []
+                        for i in range(buf_count):
+                            buf_offset = offset + 4
+                            buf_len = from_bytes_big(buf[offset:buf_offset])
+                            offset = buf_offset + buf_len
+                            all_buffers.append(buf[buf_offset:offset])
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
                 obj = MessageQueue.recv(self.local_socket, timeout)

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_SHM_BROADCAST_VERIFY: bool = False
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -583,6 +584,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    ),
+    # Opt-in diagnostic envelope (magic + length + crc32) on the inline
+    # shm_broadcast payload. When enabled, payload corruption surfaces as a
+    # structured ShmBroadcastCorruptionError instead of an opaque pickle
+    # exception. Default off; intended for investigating issues like
+    # https://github.com/vllm-project/vllm/issues/27858.
+    "VLLM_SHM_BROADCAST_VERIFY": lambda: (
+        os.environ.get("VLLM_SHM_BROADCAST_VERIFY", "0").lower() in ("1", "true")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -1799,6 +1808,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+        "VLLM_SHM_BROADCAST_VERIFY",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
