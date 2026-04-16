@@ -25,34 +25,45 @@ using namespace cute;
 template <class OutType, int ScaleGranularityM,
           int ScaleGranularityN, int ScaleGranularityK,
           class MmaTileShape, class ClusterShape,
-          class EpilogueScheduler, class MainloopScheduler>
+          class EpilogueScheduler, class MainloopScheduler,
+          bool swap_ab_ = false>
 struct cutlass_3x_gemm_fp8_blockwise {
+  static constexpr bool swap_ab = swap_ab_;
   using ElementAB = cutlass::float_e4m3_t;
 
   using ElementA = ElementAB;
   using LayoutA = cutlass::layout::RowMajor;
+  using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
   static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
   using ElementB = ElementAB;
   using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
   using ElementD = OutType;
   using LayoutD = cutlass::layout::RowMajor;
+  using LayoutD_Transpose = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   using ElementC = void; // TODO: support bias
   using LayoutC = LayoutD;
+  using LayoutC_Transpose = LayoutD_Transpose;
   static constexpr int AlignmentC = AlignmentD;
 
   using ElementAccumulator = float;
   using ElementCompute = float;
   using ElementBlockScale = float;
 
-  using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<
+  using ScaleConfig = conditional_t<swap_ab,
+      cutlass::detail::Sm90BlockwiseScaleConfig<
         ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-        cute::GMMA::Major::MN, cute::GMMA::Major::K>;
+        cute::GMMA::Major::K, cute::GMMA::Major::MN>,
+      cutlass::detail::Sm90BlockwiseScaleConfig<
+        ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+        cute::GMMA::Major::MN, cute::GMMA::Major::K>>;
 
+  // layout_SFA and layout_SFB cannot be swapped since they are deduced.
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -71,30 +82,46 @@ struct cutlass_3x_gemm_fp8_blockwise {
       ElementAccumulator,
       ElementCompute,
       ElementC,
-      LayoutC,
+      conditional_t<swap_ab, LayoutC_Transpose, LayoutC>,
       AlignmentC,
       ElementD,
-      LayoutD,
+      conditional_t<swap_ab, LayoutD_Transpose, LayoutD>,
       AlignmentD,
       EpilogueScheduler,
       DefaultOperation
   >::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag,
-      OperatorClass,
-      ElementA,
-      cute::tuple<LayoutA, LayoutSFA>,
-      AlignmentA,
-      ElementB,
-      cute::tuple<LayoutB, LayoutSFB>,
-      AlignmentB,
-      ElementAccumulator,
-      MmaTileShape,
-      ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      MainloopScheduler
-  >::CollectiveOp;
+  using CollectiveMainloop = conditional_t<swap_ab,
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag,
+          OperatorClass,
+          ElementB,
+          cute::tuple<LayoutB_Transpose, LayoutSFA>,
+          AlignmentB,
+          ElementA,
+          cute::tuple<LayoutA_Transpose, LayoutSFB>,
+          AlignmentA,
+          ElementAccumulator,
+          MmaTileShape,
+          ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          MainloopScheduler
+      >::CollectiveOp,
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag,
+          OperatorClass,
+          ElementA,
+          cute::tuple<LayoutA, LayoutSFA>,
+          AlignmentA,
+          ElementB,
+          cute::tuple<LayoutB, LayoutSFB>,
+          AlignmentB,
+          ElementAccumulator,
+          MmaTileShape,
+          ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          MainloopScheduler
+      >::CollectiveOp>;
 
   using KernelType = enable_sm90_or_later<cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
@@ -102,11 +129,42 @@ struct cutlass_3x_gemm_fp8_blockwise {
   struct GemmKernel : public KernelType {};
 };
 
+// Tile configurations for different M ranges.
+template <typename OutType>
+struct sm90_blockwise_fp8_config_default {
+  // M >= 16 and M % 4 == 0: original Cooperative config.
+  using KernelSchedule =
+      cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+  using TileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _2, _1>;
+  using Gemm = cutlass_3x_gemm_fp8_blockwise<
+      OutType, 1, 128, 128, TileShape, ClusterShape,
+      EpilogueSchedule, KernelSchedule>;
+};
+
+template <typename OutType>
+struct sm90_blockwise_fp8_config_swapab {
+  // M < 16 or M % 4 != 0: swap A/B so that the small/irregular dim becomes N.
+  // Mirrors SM120 structure — keep Cooperative TMA schedule but shrink to a
+  // cluster of 1 and a narrower N-tile, since the swapped N dim is small.
+  using KernelSchedule =
+      cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+  using TileShape = Shape<_128, _32, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  // ScaleGranularity is swapped to match the swap_ab orientation.
+  using Gemm = cutlass_3x_gemm_fp8_blockwise<
+      OutType, 128, 1, 128, TileShape, ClusterShape,
+      EpilogueSchedule, KernelSchedule, true>;
+};
+
 template <typename Gemm>
 void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Tensor const& a,
                                    torch::stable::Tensor const& b,
                                    torch::stable::Tensor const& a_scales,
                                    torch::stable::Tensor const& b_scales) {
+  static constexpr bool swap_ab = Gemm::swap_ab;
   using GemmKernel = typename Gemm::GemmKernel;
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
@@ -122,8 +180,6 @@ void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Te
 
   int32_t m = a.size(0), n = b.size(1), k = a.size(1);
 
-  STD_TORCH_CHECK(m % 4 == 0, "m must be divisible by 4");
-
   StrideA a_stride;
   StrideB b_stride;
   StrideC c_stride;
@@ -132,11 +188,13 @@ void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Te
   b_stride =
       cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
   c_stride =
-      cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+      cutlass::make_cute_packed_stride(StrideC{}, swap_ab ? cute::make_shape(n, m, 1) : cute::make_shape(m, n, 1));
 
-  LayoutSFA layout_SFA = 
+  LayoutSFA layout_SFA = swap_ab ?
+      ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1)) :
       ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-  LayoutSFB layout_SFB = 
+  LayoutSFB layout_SFB = swap_ab ?
+      ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1)) :
       ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
   auto a_ptr = static_cast<ElementAB const*>(a.data_ptr());
@@ -145,15 +203,24 @@ void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Te
   auto b_scales_ptr = static_cast<ElementBlockScale const*>(b_scales.data_ptr());
 
   typename GemmKernel::MainloopArguments mainloop_args{};
-  mainloop_args.ptr_A = a_ptr;
-  mainloop_args.dA = a_stride;
-  mainloop_args.ptr_B = b_ptr;
-  mainloop_args.dB = b_stride;
-  mainloop_args.ptr_SFA = a_scales_ptr;
   mainloop_args.layout_SFA = layout_SFA;
-  mainloop_args.ptr_SFB = b_scales_ptr;
   mainloop_args.layout_SFB = layout_SFB;
-  auto prob_shape = cute::make_shape(m, n, k, 1);
+  if (swap_ab) {
+    mainloop_args.ptr_A = b_ptr;
+    mainloop_args.dA = b_stride;
+    mainloop_args.ptr_B = a_ptr;
+    mainloop_args.dB = a_stride;
+    mainloop_args.ptr_SFA = b_scales_ptr;
+    mainloop_args.ptr_SFB = a_scales_ptr;
+  } else {
+    mainloop_args.ptr_A = a_ptr;
+    mainloop_args.dA = a_stride;
+    mainloop_args.ptr_B = b_ptr;
+    mainloop_args.dB = b_stride;
+    mainloop_args.ptr_SFA = a_scales_ptr;
+    mainloop_args.ptr_SFB = b_scales_ptr;
+  }
+  auto prob_shape = swap_ab ? cute::make_shape(n, m, k, 1) : cute::make_shape(m, n, k, 1);
 
   auto c_ptr = static_cast<ElementD*>(out.data_ptr());
   typename GemmKernel::EpilogueArguments epilogue_args{
@@ -168,11 +235,21 @@ void cutlass_gemm_blockwise_sm90_fp8_dispatch(torch::stable::Tensor& out,
                                               torch::stable::Tensor const& b,
                                               torch::stable::Tensor const& a_scales,
                                               torch::stable::Tensor const& b_scales) {
-  // TODO: better heuristics
-  cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<
-      OutType, 1, 128, 128, Shape<_128, _128, _128>,
-      Shape<_1, _2, _1>, cutlass::epilogue::TmaWarpSpecializedCooperative,
-      cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum>>(
+  int32_t m = a.size(0);
+
+  // Route small or non-multiple-of-4 M through the swap_ab kernel. This
+  // matches the SM100/SM120 blockwise heuristic and replaces the previous
+  // hard m % 4 == 0 check, which caused runtime errors on odd M.
+  bool swap_ab = (m < 16) || (m % 4 != 0);
+
+  if (swap_ab) {
+    using Gemm = typename sm90_blockwise_fp8_config_swapab<OutType>::Gemm;
+    return cutlass_gemm_caller_blockwise<Gemm>(
+        out, a, b, a_scales, b_scales);
+  }
+
+  using Gemm = typename sm90_blockwise_fp8_config_default<OutType>::Gemm;
+  return cutlass_gemm_caller_blockwise<Gemm>(
       out, a, b, a_scales, b_scales);
 }
 
