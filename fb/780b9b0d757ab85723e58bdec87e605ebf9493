@@ -1,0 +1,21 @@
+vllm/v1/core/kv_cache_utils.py
+  s_01d8ecd5cc568d::t_10b136bb209294 1998
+  s_01d8ecd5cc568d::t_b048c6cf774ebc 1985-1997,1999-2007
+  s_01d8ecd5cc568d::t_f186576166906a 2008-2009
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fb780b9b0d757ab85723e58bdec87e605ebf9493",
+  "prompts": {},
+  "sessions": {
+    "s_01d8ecd5cc568d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e56c-b7f7-74d3-b99e-59fc57a2d435",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "leon <2695316095@qq.com>"
+    }
+  }
+}
