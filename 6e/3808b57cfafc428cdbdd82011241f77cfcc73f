@@ -1,0 +1,23 @@
+vllm/v1/worker/utils.py
+  s_01d8ecd5cc568d::t_75b1e1e3900934 40,446-447,449-450,454,457,463,467,475
+vllm/v1/attention/backends/flashinfer.py
+  s_01d8ecd5cc568d::t_8d186c0e45a902 1649-1663
+  s_01d8ecd5cc568d::t_7caa7e2034ca94 1647-1648
+  s_01d8ecd5cc568d::t_ca4ef8b0df0a05 503,507,968,975,1822
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6e3808b57cfafc428cdbdd82011241f77cfcc73f",
+  "prompts": {},
+  "sessions": {
+    "s_01d8ecd5cc568d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e56c-b7f7-74d3-b99e-59fc57a2d435",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "leon <2695316095@qq.com>"
+    }
+  }
+}
