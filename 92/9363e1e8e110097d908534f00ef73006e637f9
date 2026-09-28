@@ -1,0 +1,42 @@
+vllm/v1/worker/gpu/attn_utils.py
+  s_01d8ecd5cc568d::t_af78d88fca195e 393
+vllm/v1/attention/backend.py
+  s_01d8ecd5cc568d::t_af78d88fca195e 374-386
+  s_01d8ecd5cc568d::t_7693783216f36a 373
+vllm/v1/attention/backends/flashinfer.py
+  s_01d8ecd5cc568d::t_8ab4185e97efa6 503-506,508,514-515,517-527
+  s_01d8ecd5cc568d::t_2379c6b1fd4f9a 749,977,980-981,984,992-995,1002-1004
+  s_01d8ecd5cc568d::t_eba62562f67e6e 500-501,507,509-511,985-991
+  s_01d8ecd5cc568d::t_f33c83f0a1e19d 974-976,997-998
+  s_01d8ecd5cc568d::t_00fa8cd2730edc 2235
+  s_01d8ecd5cc568d::t_95cf21cc5ee542 88-92,492-499,502,512-513,516,528-529,729,750-751,978-979,982-983,996,999-1001,1005-1012,1378,1402-1405,1456-1458,1535,1615,1620-1635,1981-1983,2232-2234,2236
+  s_01d8ecd5cc568d::t_83e5ed7eea7c17 2237-2243,2916-2917,2928-2929
+vllm/v1/attention/ops/flashinfer_repage.py
+  s_01d8ecd5cc568d::t_0829c6cb7babb4 1-22,28-30,32,35-36,43-46,48-51,53-56,60-68,72,75-77,79,81,84-85,87-91,93-98,102-103,106,108,112,115-117,119
+  s_01d8ecd5cc568d::t_6a3464da4da0ec 23-27,31,33-34,37-42,47,52,69-71,73-74,78,80,82-83,86,92,99-101,104-105,107,109-111,113-114,118,120
+  s_01d8ecd5cc568d::t_eba62562f67e6e 57-59
+vllm/v1/worker/gpu_model_runner.py
+  s_01d8ecd5cc568d::t_68421453fbb76e 6560-6562
+  s_01d8ecd5cc568d::t_af78d88fca195e 7289
+vllm/v1/worker/utils.py
+  s_01d8ecd5cc568d::t_68421453fbb76e 708
+  s_01d8ecd5cc568d::t_af78d88fca195e 394-395,448-463
+  s_01d8ecd5cc568d::t_a1d36148a5d09d 677-679
+  s_01d8ecd5cc568d::t_4a3217cf8c6426 464-466,680-681,709-710
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "929363e1e8e110097d908534f00ef73006e637f9",
+  "prompts": {},
+  "sessions": {
+    "s_01d8ecd5cc568d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e56c-b7f7-74d3-b99e-59fc57a2d435",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "leon <2695316095@qq.com>"
+    }
+  }
+}
